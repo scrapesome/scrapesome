@@ -1,39 +1,25 @@
 """
-Playwright Browser Pool Manager for Scrapesome
-----------------------------------------------
+browser_pool.py
 
-This module provides thread-safe, reusable browser context pools for Playwright.
-Supports both synchronous and asynchronous modes, minimizing browser startup overhead.
+Minimal Playwright browser-context pools for Scrapesome.
 
-Features:
-    - Separate pools for synchronous and asynchronous Playwright usage.
-    - Singleton pattern (one pool per process per mode).
-    - Configurable pool size via settings.
-    - Graceful shutdown and cleanup via atexit.
-    - Safe acquire/release of browser contexts.
-
-Usage (Synchronous):
-    from scrapesome.scraper.browser_pool import SyncBrowserPool
-    pool = SyncBrowserPool()
-    ctx = pool.acquire_context()
-    ...
-    pool.release_context(ctx)
-
-Usage (Asynchronous):
-    from scrapesome.scraper.browser_pool import AsyncBrowserPool
-    pool = await AsyncBrowserPool.get_instance()
-    ctx = await pool.acquire_context()
-    ...
-    await pool.release_context(ctx)
+Design:
+  - Simple list-based pools (pop/append) like the pattern used in scraper.py.
+  - No singletons, no atexit, no cross-loop tricks.
+  - Explicit lifecycle: create -> acquire/release -> close.
+  - Caller is responsible for concurrency control (Semaphore) as in scraper.py.
 """
 
-import atexit
-import threading
+from __future__ import annotations
+
+import time
 import asyncio
-from queue import Queue, Empty
-from asyncio import Queue as AsyncQueue
+from typing import List, Optional
+
+# sync/async Playwright APIs
 from playwright.sync_api import sync_playwright, BrowserContext
 from playwright.async_api import async_playwright, BrowserContext as AsyncBrowserContext
+
 from scrapesome.logging import get_logger
 from scrapesome.config import Settings
 from scrapesome.exceptions import ScraperError
@@ -42,219 +28,240 @@ settings = Settings()
 logger = get_logger()
 
 
-# ==========================
-# Synchronous Browser Pool
-# ==========================
 class SyncBrowserPool:
     """
-    Singleton, thread-safe pool of synchronous Playwright Chromium browser contexts.
+    Minimal synchronous browser context pool.
 
-    Pre-creates a fixed number of browser contexts for reuse, reducing
-    startup overhead when fetching multiple pages synchronously.
+    Usage (same style as your scraper.py):
+        pool = SyncBrowserPool(pool_size=2)
+        ctx = pool.acquire_context()          # blocks until available
+        page = ctx.new_page()
+        ...
+        page.close()
+        pool.release_context(ctx)
+        pool.close()
     """
-    _instance = None
-    _lock = threading.Lock()
 
-    def __new__(cls, pool_size: int = None):
-        with cls._lock:
-            if cls._instance is None:
-                cls._instance = super().__new__(cls)
-                cls._instance._initialized = False
-        return cls._instance
-
-    def __init__(self, pool_size: int = None):
-        if getattr(self, "_initialized", False):
-            return
+    def __init__(self, pool_size: Optional[int] = None):
         self.pool_size = pool_size or getattr(settings, "browser_pool_size", 2)
-        self.queue = Queue(maxsize=self.pool_size)
-        self.playwright = None
-        self.browser = None
-        self._init_lock = threading.Lock()
+        self._playwright = None
+        self._browser = None
+        self._contexts: List[BrowserContext] = []
+        self._closed = False
         self._initialize_pool()
-        atexit.register(self.close)
-        self._initialized = True
 
-    def _initialize_pool(self):
-        """Initialize Playwright and pre-create browser contexts for the pool."""
-        with self._init_lock:
+    def _initialize_pool(self) -> None:
+        try:
+            logger.info(f"Initializing SyncBrowserPool (size={self.pool_size})")
+            self._playwright = sync_playwright().start()
+            self._browser = self._playwright.chromium.launch(headless=True)
+            for i in range(self.pool_size):
+                ctx = self._browser.new_context(java_script_enabled=True)
+                self._contexts.append(ctx)
+                logger.info(f"Sync context created {i+1}/{self.pool_size}")
+        except Exception as e:
+            logger.exception("Failed to initialize SyncBrowserPool")
             try:
-                logger.info(f"Initializing synchronous browser pool (size={self.pool_size})")
-                self.playwright = sync_playwright().start()
-                self.browser = self.playwright.chromium.launch(headless=True)
-                for i in range(self.pool_size):
-                    ctx = self.browser.new_context(java_script_enabled=True)
-                    self.queue.put(ctx)
-                    logger.info(f"Created sync context {i+1}/{self.pool_size}")
-            except Exception as e:
-                logger.exception("Failed to initialize synchronous browser pool")
-                raise ScraperError(f"Sync browser pool initialization failed: {e}") from e
+                self.close()
+            except Exception:
+                pass
+            raise ScraperError(f"Sync browser pool initialization failed: {e}") from e
 
-    def acquire_context(self, timeout: int = 10) -> BrowserContext:
+    def acquire_context(self, timeout: Optional[float] = None) -> BrowserContext:
         """
-        Acquire a browser context from the pool.
-
-        Args:
-            timeout (int): Time in seconds to wait for an available context.
-
-        Returns:
-            BrowserContext: Playwright browser context.
-
-        Raises:
-            ScraperError: If no context is available within the timeout.
+        Pop and return a context. If timeout is None, block until available.
+        If timeout is provided (seconds), wait up to that long polling periodically.
         """
+        if self._closed:
+            raise ScraperError("SyncBrowserPool is closed")
+
+        end = None if timeout is None else time.monotonic() + float(timeout)
+        while True:
+            if self._contexts:
+                ctx = self._contexts.pop()
+                logger.info("Acquired synchronous browser context from pool")
+                return ctx
+            if end is not None and time.monotonic() >= end:
+                raise ScraperError("No available synchronous browser context in pool (timeout)")
+            time.sleep(0.05)
+
+    def release_context(self, context: BrowserContext) -> None:
+        """Return the context to the pool (best-effort cleanup first)."""
+        if self._closed:
+            try:
+                context.close()
+            except Exception:
+                pass
+            return
+
         try:
-            ctx = self.queue.get(timeout=timeout)
-            logger.info("Acquired synchronous browser context from pool")
-            return ctx
-        except Empty:
-            raise ScraperError("No available synchronous browser context in pool (timeout)")
-
-    def release_context(self, context: BrowserContext):
-        """
-        Release a browser context back to the pool.
-
-        Clears cookies and permissions before reuse.
-
-        Args:
-            context (BrowserContext): Context to release.
-        """
-        try:
-            context.clear_cookies()
-            context.clear_permissions()
-            self.queue.put(context)
+            try:
+                context.clear_cookies()
+            except Exception:
+                pass
+            try:
+                context.clear_permissions()
+            except Exception:
+                pass
+            self._contexts.append(context)
             logger.info("Released synchronous browser context back to pool")
         except Exception as e:
-            logger.warning(f"Failed to release synchronous context cleanly: {e}")
+            logger.warning(f"Failed to release sync context cleanly: {e}")
             try:
                 context.close()
             except Exception:
                 pass
 
-    def close(self):
-        """Shutdown the synchronous browser pool and clean up resources."""
-        logger.info("Closing synchronous browser pool")
+    def close(self) -> None:
+        """Close contexts, browser, and Playwright. After this pool is unusable."""
+        if self._closed:
+            return
+        self._closed = True
+
+        logger.info("Closing SyncBrowserPool")
+        while self._contexts:
+            ctx = self._contexts.pop()
+            try:
+                ctx.close()
+            except Exception:
+                logger.debug("Exception while closing sync context", exc_info=True)
+
         try:
-            while not self.queue.empty():
-                ctx = self.queue.get_nowait()
-                try:
-                    ctx.close()
-                except Exception:
-                    pass
-            if self.browser:
-                self.browser.close()
-            if self.playwright:
-                self.playwright.stop()
-        except Exception as e:
-            logger.warning(f"Error during synchronous pool cleanup: {e}")
+            if self._browser:
+                self._browser.close()
+        except Exception:
+            logger.debug("Exception closing sync browser", exc_info=True)
+        try:
+            if self._playwright:
+                self._playwright.stop()
+        except Exception:
+            logger.debug("Exception stopping sync playwright", exc_info=True)
+
+        self._browser = None
+        self._playwright = None
+        logger.info("SyncBrowserPool closed")
 
 
-# ==========================
-# Asynchronous Browser Pool
-# ==========================
 class AsyncBrowserPool:
     """
-    Singleton, async-compatible pool of Playwright Chromium browser contexts.
+    Minimal asynchronous browser context pool.
 
-    Pre-creates a fixed number of async browser contexts for reuse,
-    improving performance when fetching multiple pages asynchronously.
+    Usage:
+        pool = await AsyncBrowserPool.create(pool_size=2)
+        ctx = await pool.acquire_context()
+        page = await ctx.new_page()
+        ...
+        await page.close()
+        await pool.release_context(ctx)
+        await pool.close()
+
+    Note: concurrency control (how many tasks run at once) should be done by
+    the caller, e.g. with an asyncio.Semaphore (exactly like your scraper.py).
     """
-    _instance = None
-    _lock = asyncio.Lock()
 
-    def __init__(self, pool_size: int = None):
+    def __init__(self, pool_size: Optional[int] = None):
+        # Use the async factory `create()` to instantiate & initialize the pool.
         self.pool_size = pool_size or getattr(settings, "browser_pool_size", 2)
-        self.queue: AsyncQueue = AsyncQueue(maxsize=self.pool_size)
-        self.playwright = None
-        self.browser = None
+        self._playwright = None
+        self._browser = None
+        self._contexts: List[AsyncBrowserContext] = []
+        self._closed = False
 
     @classmethod
-    async def get_instance(cls, pool_size: int = None):
-        """
-        Retrieve the singleton instance of the async browser pool.
+    async def create(cls, pool_size: Optional[int] = None) -> "AsyncBrowserPool":
+        """Async factory: constructs and initializes the pool."""
+        self = cls(pool_size)
+        await self._initialize_pool()
+        return self
 
-        Args:
-            pool_size (int, optional): Number of contexts in the pool.
-
-        Returns:
-            AsyncBrowserPool: Singleton async pool instance.
-        """
-        async with cls._lock:
-            if cls._instance is None:
-                instance = cls(pool_size)
-                await instance._initialize_pool()
-                # Schedule cleanup at exit
-                atexit.register(lambda: asyncio.create_task(instance.close()))
-                cls._instance = instance
-        return cls._instance
-
-    async def _initialize_pool(self):
-        """Initialize async Playwright and pre-create browser contexts."""
+    async def _initialize_pool(self) -> None:
         try:
-            logger.info(f"Initializing asynchronous browser pool (size={self.pool_size})")
-            self.playwright = await async_playwright().start()
-            self.browser = await self.playwright.chromium.launch(headless=True)
+            logger.info(f"Initializing AsyncBrowserPool (size={self.pool_size})")
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(headless=True)
             for i in range(self.pool_size):
-                ctx = await self.browser.new_context(java_script_enabled=True)
-                await self.queue.put(ctx)
-                logger.info(f"Created async context {i+1}/{self.pool_size}")
+                ctx = await self._browser.new_context(java_script_enabled=True)
+                self._contexts.append(ctx)
+                logger.info(f"Async context created {i+1}/{self.pool_size}")
         except Exception as e:
-            logger.exception("Failed to initialize asynchronous browser pool")
+            logger.exception("Failed to initialize AsyncBrowserPool")
+            try:
+                await self.close()
+            except Exception:
+                pass
             raise ScraperError(f"Async browser pool initialization failed: {e}") from e
 
-    async def acquire_context(self, timeout: int = 10) -> AsyncBrowserContext:
+    async def acquire_context(self, timeout: Optional[float] = None) -> AsyncBrowserContext:
         """
-        Acquire an async browser context from the pool.
-
-        Args:
-            timeout (int): Maximum time in seconds to wait for an available context.
-
-        Returns:
-            AsyncBrowserContext: Playwright browser context.
-
-        Raises:
-            ScraperError: If no context is available within the timeout.
+        Pop and return an async context. If timeout is None, wait until one available.
+        If timeout is provided, wait up to that many seconds (polling).
         """
+        if self._closed:
+            raise ScraperError("AsyncBrowserPool is closed")
+
+        loop = asyncio.get_event_loop()
+        end = None if timeout is None else loop.time() + float(timeout)
+        while True:
+            if self._contexts:
+                ctx = self._contexts.pop()
+                logger.info("Acquired asynchronous browser context from pool")
+                return ctx
+            if end is not None and loop.time() >= end:
+                raise ScraperError("No available asynchronous browser context in pool (timeout)")
+            await asyncio.sleep(0.05)
+
+    async def release_context(self, context: AsyncBrowserContext) -> None:
+        """Return async context to pool (best-effort cleanup first)."""
+        if self._closed:
+            try:
+                await context.close()
+            except Exception:
+                pass
+            return
+
         try:
-            ctx = await asyncio.wait_for(self.queue.get(), timeout)
-            logger.info("Acquired asynchronous browser context from pool")
-            return ctx
-        except asyncio.TimeoutError:
-            raise ScraperError("No available asynchronous browser context in pool (timeout)")
-
-    async def release_context(self, context: AsyncBrowserContext):
-        """
-        Release an async browser context back to the pool.
-
-        Clears cookies and permissions before reuse.
-
-        Args:
-            context (AsyncBrowserContext): Context to release.
-        """
-        try:
-            await context.clear_cookies()
-            await context.clear_permissions()
-            await self.queue.put(context)
+            try:
+                await context.clear_cookies()
+            except Exception:
+                pass
+            try:
+                await context.clear_permissions()
+            except Exception:
+                pass
+            self._contexts.append(context)
             logger.info("Released asynchronous browser context back to pool")
         except Exception as e:
-            logger.warning(f"Failed to release asynchronous context cleanly: {e}")
+            logger.warning(f"Failed to release async context cleanly: {e}")
             try:
                 await context.close()
             except Exception:
                 pass
 
-    async def close(self):
-        """Shutdown the asynchronous browser pool and clean up resources."""
-        logger.info("Closing asynchronous browser pool")
+    async def close(self) -> None:
+        """Close contexts, browser, and Playwright asynchronously."""
+        if self._closed:
+            return
+        self._closed = True
+
+        logger.info("Closing AsyncBrowserPool")
+        while self._contexts:
+            ctx = self._contexts.pop()
+            try:
+                await ctx.close()
+            except Exception:
+                logger.debug("Exception while closing async context", exc_info=True)
+
         try:
-            while not self.queue.empty():
-                ctx = await self.queue.get()
-                try:
-                    await ctx.close()
-                except Exception:
-                    pass
-            if self.browser:
-                await self.browser.close()
-            if self.playwright:
-                await self.playwright.stop()
-        except Exception as e:
-            logger.warning(f"Error during asynchronous pool cleanup: {e}")
+            if self._browser:
+                await self._browser.close()
+        except Exception:
+            logger.debug("Exception closing async browser", exc_info=True)
+        try:
+            if self._playwright:
+                await self._playwright.stop()
+        except Exception:
+            logger.debug("Exception stopping async playwright", exc_info=True)
+
+        self._browser = None
+        self._playwright = None
+        logger.info("AsyncBrowserPool closed")

@@ -10,4 +10,4 @@ from .scraper.async_scraper import async_scraper
 
 __all__ = ["sync_scraper", "async_scraper"]
 
-__version__ = "0.1.4"
+__version__ = "0.1.7"

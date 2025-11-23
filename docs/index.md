@@ -22,6 +22,7 @@ Welcome to the documentation for **ScrapeSome** — a modern, async/sync-capable
 - 🔁 Sync + Async scraping support
 - 🔄 Automatic retries and intelligent fallbacks
 - 🧪 Playwright rendering fallback for JS-heavy pages
+- ⚡ **Parallel scraping support (async-only)** — execute multiple requests simultaneously using shared Playwright browser pools.
 - 📝 Format responses as raw HTML, plain **text**, **Markdown**, or structured **JSON**
 - ⚙️ Configurable: timeouts, redirects, user agents, and logging
 - 🧪 Test coverage with `pytest` and `pytest-asyncio`
@@ -89,6 +90,7 @@ scrapesome/
 │   └── rendering.py
 ├── utils/
 │   ├── __init__.py
+│   ├── browser_pool.py
 │   └── file_writer.py
 ├── docs/
 │   ├── index.md

@@ -141,3 +141,63 @@ async def test_async_scraper_short_content_triggers_render(mock_render, mock_get
     result = await async_scraper("http://fake.com")
     result = result.get("data")
     assert "Rendered Content" in result
+
+@pytest.mark.asyncio
+@patch("scrapesome.scraper.async_scraper.httpx.AsyncClient.get", new_callable=AsyncMock)
+async def test_async_scraper_multi_url_sequential_single_url(mock_get):
+    """
+    If a list of URLs is provided with less than 2 items,
+    pool_size should fallback to settings.browser_pool_size.
+    Ensures sequential execution.
+    """
+    mock_resp = AsyncMock(status_code=200, text="<html>" + ("abc " * 100) + "</html>")
+    mock_get.return_value = mock_resp
+
+    urls = ["single.com"]  # only one URL
+
+    result = await async_scraper(urls=urls, run_concurrently=False)
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert "abc" in result[0]["data"]
+
+@pytest.mark.asyncio
+@patch("scrapesome.scraper.async_scraper.fetch_url", side_effect=Exception("Fail"))
+async def test_async_scraper_scrape_single_exception_wrapper(mock_fetch):
+    """
+    Ensure that _scrape_single returns a dict with 'error' key
+    when fetch_url raises an exception.
+    """
+    from scrapesome.scraper.async_scraper import _scrape_single
+    result = await _scrape_single(
+        url="http://fail.com",
+        user_agents=["UA"],
+        headers=None,
+        allow_redirects=True,
+        max_retries=1,
+        timeout=1,
+        force_playwright=False,
+        pool_size=1,
+        output_format_type="text",
+        file_name=None,
+        save_to_file=False,
+    )
+    assert "error" in result
+    assert "Fail" in result["error"]
+
+@pytest.mark.asyncio
+async def test_async_scraper_valueerror_url_and_urls():
+    """
+    Provide both url and urls should raise ValueError.
+    """
+    import pytest
+    with pytest.raises(ValueError):
+        await async_scraper(url="a.com", urls=["b.com"])
+
+@pytest.mark.asyncio
+async def test_async_scraper_valueerror_urls_not_list():
+    """
+    Provide urls as a non-list type should raise ValueError.
+    """
+    import pytest
+    with pytest.raises(ValueError):
+        await async_scraper(urls="not-a-list")

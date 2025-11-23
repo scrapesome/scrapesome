@@ -15,7 +15,9 @@ The tests use `unittest.mock` to patch dependencies and simulate different condi
 
 from unittest.mock import patch, MagicMock
 import requests
+import pytest
 from scrapesome import sync_scraper
+from scrapesome.exceptions import ScraperError
 
 # SUCCESS: simple fetch returns content with output_format_type
 @patch("scrapesome.scraper.sync_scraper.sync_render_page")
@@ -152,3 +154,30 @@ def test_sync_scraper_short_content_triggers_render(mock_render, mock_get):
     result = result.get("data")
     assert "Rendered Content" in result
 
+
+def test_sync_scraper_multi_url_concurrent_raises():
+    """
+    Test that sync_scraper raises ScraperError when attempting to run multiple URLs
+    concurrently, since parallel scraping is not supported in sync_scraper.
+    """
+    urls = ["http://site1.com", "http://site2.com"]
+    with pytest.raises(ScraperError, match="Parallel scraping is only supported in async_scraper"):
+        sync_scraper(urls=urls, run_concurrently=True)
+
+def test_sync_scraper_multi_url_serial_raises():
+    """
+    Test that sync_scraper raises ScraperError when attempting to run multiple URLs
+    serially, since parallel scraping is restricted in sync_scraper.
+    """
+    urls = ["http://siteA.com", "http://siteB.com"]
+    with pytest.raises(ScraperError, match="Parallel scraping is only supported in async_scraper"):
+        sync_scraper(urls=urls, run_concurrently=False)
+
+def test_sync_scraper_multi_url_pool_raises():
+    """
+    Test that sync_scraper raises ScraperError when a pool size is provided
+    for multiple URLs, as sync_scraper does not support browser pools for concurrency.
+    """
+    urls = ["http://a.com", "http://b.com", "http://c.com"]
+    with pytest.raises(ScraperError, match="Parallel scraping is only supported in async_scraper"):
+        sync_scraper(urls=urls, pool_size=3)

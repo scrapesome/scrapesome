@@ -43,6 +43,7 @@ class Settings:
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
             "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:115.0) Gecko/20100101 Firefox/115.0",
         ])
+        self.browser_pool_size = self._get("PLAYWRIGHT_BROWSER_POOL_SIZE", default="1")
 
 
     def _get(self, key: str, default: Any | None = None):

@@ -16,6 +16,7 @@ Usage:
 """
 
 import random
+import asyncio
 from typing import Optional, List
 from playwright.sync_api import TimeoutError as SyncTimeoutError
 from playwright.async_api import TimeoutError as AsyncTimeoutError
@@ -43,41 +44,64 @@ def _should_block(request_url: str, resource_type: str) -> bool:
     return resource_type in blocked_resources or "ads" in request_url
 
 
-def sync_render_page(url: str, headers: Optional[dict] = None, timeout: int = int(settings.fetch_playwright_timeout), user_agents: Optional[List[str]] = None) -> str:
+def sync_render_page(
+    url: str,
+    headers: Optional[dict] = None,
+    timeout: int = int(settings.fetch_playwright_timeout),
+    user_agents: Optional[List[str]] = None,
+    pool: Optional[SyncBrowserPool] = None
+) -> str:
     """
-    Renders the given URL using synchronous Playwright with headless Chromium
-    via browser pooling.
+    Render URL using synchronous Playwright via a SyncBrowserPool.
 
     Args:
-        url (str): URL to render.
-        headers (Optional[dict]): Optional request headers.
-        timeout (int): Timeout in seconds for page load.
-        user_agents (Optional[List[str]]): List of user agents to rotate.
+        url: URL to render.
+        headers: Optional request headers.
+        timeout: Timeout seconds.
+        user_agents: Optional list to rotate User-Agent header.
+        pool: Optional SyncBrowserPool instance. If None, a temporary pool (size=1) is created.
 
     Returns:
-        str: Rendered HTML content of the page.
+        Rendered HTML content.
 
     Raises:
-        ScraperError: If page rendering fails.
+        ScraperError on failure.
     """
-    pool = SyncBrowserPool()
+    local_pool = None
     context = None
+    page = None
     try:
-        # Acquire a pre-created browser context from the pool
-        context = pool.acquire_context()
-        context_args = {}
-        context_args["java_script_enabled"] = True
-        if user_agents:
-            context_args["user_agent"] = random.choice(user_agents)
+        # prepare pool (use provided or create temp pool of size 1)
+        if pool is None:
+            local_pool = SyncBrowserPool(pool_size=int(settings.browser_pool_size))
+            pool_to_use = local_pool
+        else:
+            pool_to_use = pool
 
+        context = pool_to_use.acquire_context()
+        # create a page per-request and apply headers/UA on the page
         page = context.new_page()
-        if headers:
-            page.set_extra_http_headers(headers)
 
-        # Block images and ads for performance
-        context.route("**/*", lambda route, request: route.abort()
-                      if _should_block(request.url, request.resource_type)
-                      else route.continue_())
+        effective_headers = dict(headers or {})
+        if user_agents:
+            effective_headers["User-Agent"] = random.choice(user_agents)
+        if effective_headers:
+            page.set_extra_http_headers(effective_headers)
+
+        # sync route handler
+        def _route_handler(route, request):
+            try:
+                if _should_block(request.url, request.resource_type):
+                    route.abort()
+                else:
+                    route.continue_()
+            except Exception:
+                try:
+                    route.continue_()
+                except Exception:
+                    pass
+
+        context.route("**/*", _route_handler)
 
         try:
             page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
@@ -95,54 +119,82 @@ def sync_render_page(url: str, headers: Optional[dict] = None, timeout: int = in
         raise ScraperError(f"Sync rendering failed for {url}") from e
 
     finally:
-        # Release the context back to the pool
+        # close page, release context, and close local pool if created
+        try:
+            if page:
+                page.close()
+        except Exception:
+            logger.debug("Failed to close sync page", exc_info=True)
         if context:
             try:
-                pool.release_context(context)
-            except Exception as e:
-                logger.warning(f"Failed to release sync context for {url}: {e}")
+                pool_to_use.release_context(context)
+            except Exception:
+                logger.warning(f"Failed to release sync context for {url}")
+        if local_pool:
+            try:
+                local_pool.close()
+            except Exception:
+                logger.debug("Failed to close temporary sync pool", exc_info=True)
 
 
 async def async_render_page(
     url: str,
     headers: Optional[dict] = None,
     timeout: int = int(settings.fetch_playwright_timeout),
-    user_agents: Optional[List[str]] = None
+    user_agents: Optional[List[str]] = None,
+    pool: Optional[AsyncBrowserPool] = None
 ) -> str:
     """
-    Renders the given URL using asynchronous Playwright with headless Chromium
-    via browser pooling.
+    Render URL using async Playwright via an AsyncBrowserPool.
 
     Args:
-        url (str): URL to render.
-        headers (Optional[dict]): Optional request headers.
-        timeout (int): Timeout in seconds for page load.
-        user_agents (Optional[List[str]]): List of user agents to rotate.
+        url: URL to render.
+        headers: Optional request headers.
+        timeout: Timeout seconds.
+        user_agents: Optional list to rotate User-Agent header.
+        pool: Optional AsyncBrowserPool instance. If None, a temporary pool (size=1) is created.
 
     Returns:
-        str: Rendered HTML content of the page.
+        Rendered HTML content.
 
     Raises:
-        ScraperError: If page rendering fails.
+        ScraperError on failure.
     """
-    pool = await AsyncBrowserPool.get_instance()
+    local_pool = None
     context = None
+    page = None
     try:
-        # Acquire a pre-created async browser context from the pool
-        context = await pool.acquire_context()
-        context_args = {}
-        context_args["java_script_enabled"] = True
-        if user_agents:
-            context_args["user_agent"] = random.choice(user_agents)
+        # prepare pool (use provided or create a temp pool of size 1)
+        if pool is None:
+            local_pool = await AsyncBrowserPool.create(pool_size=int(settings.browser_pool_size))
+            pool_to_use = local_pool
+        else:
+            pool_to_use = pool
+
+        context = await pool_to_use.acquire_context()
 
         page = await context.new_page()
-        if headers:
-            await page.set_extra_http_headers(headers)
 
-        # Block images and ads for performance
-        await context.route("**/*", lambda route, request: route.abort()
-                            if _should_block(request.url, request.resource_type)
-                            else route.continue_())
+        effective_headers = dict(headers or {})
+        if user_agents:
+            effective_headers["User-Agent"] = random.choice(user_agents)
+        if effective_headers:
+            await page.set_extra_http_headers(effective_headers)
+
+        # async route handler
+        async def _route_handler(route, request):
+            try:
+                if _should_block(request.url, request.resource_type):
+                    await route.abort()
+                else:
+                    await route.continue_()
+            except Exception:
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
+
+        await context.route("**/*", _route_handler)
 
         try:
             await page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
@@ -160,9 +212,19 @@ async def async_render_page(
         raise ScraperError(f"Async rendering failed for {url}") from e
 
     finally:
-        # Release the async context back to the pool
+        # close page, release context, and close local pool if created
+        try:
+            if page:
+                await page.close()
+        except Exception:
+            logger.debug("Failed to close async page", exc_info=True)
         if context:
             try:
-                await pool.release_context(context)
-            except Exception as e:
-                logger.warning(f"Failed to release async context for {url}: {e}")
+                await pool_to_use.release_context(context)
+            except Exception:
+                logger.warning(f"Failed to release async context for {url}")
+        if local_pool:
+            try:
+                await local_pool.close()
+            except Exception:
+                logger.debug("Failed to close temporary async pool", exc_info=True)
