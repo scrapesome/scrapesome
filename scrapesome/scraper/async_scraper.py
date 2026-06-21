@@ -21,6 +21,7 @@ from scrapesome.exceptions import ScraperError
 from scrapesome.scraper.rendering import async_render_page
 from scrapesome.formatter.output_formatter import format_response
 from scrapesome.utils.file_writer import write
+from scrapesome.utils.fetch_visible_content import visible_text_length
 from scrapesome.config import Settings
 
 settings = Settings()
@@ -145,9 +146,10 @@ async def fetch_url(
                     continue
 
                 response.raise_for_status()
-                text = response.text
 
-                if len(text.strip()) < 200:
+                # Heuristic: if content is very short, possibly JS-rendered page
+                visible_content = visible_text_length(html=response.text)
+                if len(visible_content) < 200:
                     logger.info(f"Content too short, attempting JS rendering for {url}")
                     try:
                         return await async_render_page(url, timeout=timeout)
@@ -156,7 +158,7 @@ async def fetch_url(
                         raise ScraperError(f"Failed JS rendering fallback for {url}") from e
 
                 logger.info(f"Successfully fetched {url} without JS rendering.")
-                return text
+                return response.text
 
         except (httpx.RequestError, httpx.HTTPStatusError, httpx.TimeoutException) as exc:
             logger.error(f"RequestException for {url} on attempt {attempt + 1}: {exc}")

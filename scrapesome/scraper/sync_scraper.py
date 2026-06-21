@@ -23,6 +23,7 @@ from scrapesome.exceptions import ScraperError
 from scrapesome.scraper.rendering import sync_render_page
 from scrapesome.formatter.output_formatter import format_response
 from scrapesome.utils.file_writer import write
+from scrapesome.utils.fetch_visible_content import visible_text_length
 from scrapesome.config import Settings
 
 settings = Settings()
@@ -144,7 +145,8 @@ def fetch_url(
             response.raise_for_status()
 
             # Heuristic: if content is very short, possibly JS-rendered page
-            if len(response.text.strip()) < 200:
+            visible_content = visible_text_length(html=response.text)
+            if len(visible_content) < 200:
                 logger.info(f"Content too short, attempting JS rendering for {url}")
                 try:
                     return sync_render_page(url, headers=headers, timeout=timeout)
