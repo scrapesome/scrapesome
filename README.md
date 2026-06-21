@@ -417,6 +417,7 @@ scrapesome/
 │   └── rendering.py
 ├── utils/
 │   ├── __init__.py
+│   ├── fetch_visible_content.py
 │   └── file_writer.py
 ├── docs/
 │   ├── index.md
@@ -441,6 +442,7 @@ scrapesome/
 │   ├── test_logging.py
 │   ├── test_rendering.py
 │   ├── test_file_writer.py
+│   ├── test_fetch_visible_content.py
 │   ├── test_output_formatter.py
 │   └── test_cli.py
 ├── setup.py
